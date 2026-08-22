@@ -127,7 +127,7 @@ class Scaffold {
   }
 
   async scaffold() {
-    this.registry = (await getRegistry()).replace(/\/$/, '')
+    this.registry = ((await getRegistry()) ?? 'https://registry.npmjs.org').replace(/\/$/, '')
     console.log(kleur.dim('  Registry server: ') + this.registry)
 
     console.log(kleur.dim('  Scaffolding project in ') + project + kleur.dim(' ...'))

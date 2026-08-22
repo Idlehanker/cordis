@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module'
-import Loader from '@cordisjs/loader'
+import Loader, { type ModuleLoader } from '@cordisjs/loader'
 import * as daemon from './daemon.js'
 import * as logger from './logger.js'
 import { Context } from '../index.ts'
