@@ -4,6 +4,8 @@
     "baseUrl": ".",
     "paths": {
       // explicitly override subpath exports
+      "cosmokit": ["../cosmokit/src"],
+      "cosmokit/*": ["../cosmokit/src/*"],
       "cordis/*": ["packages/cordis/src/*"],
       "cordis": ["packages/cordis/src"],
       "create-cordis": ["packages/*/src"],
