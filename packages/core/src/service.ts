@@ -11,8 +11,8 @@ export abstract class Service<T = unknown, C extends Context = Context> {
   static readonly provide: unique symbol = symbols.provide as any
   static readonly immediate: unique symbol = symbols.immediate as any
 
-  protected start(): Awaitable<void> {}
-  protected stop(): Awaitable<void> {}
+  protected start(): Awaitable<void> { }
+  protected stop(): Awaitable<void> { }
   protected fork?(ctx: C, config: any): void
 
   protected ctx!: C
@@ -45,7 +45,11 @@ export abstract class Service<T = unknown, C extends Context = Context> {
       property: 'ctx',
     }
     if (self[symbols.invoke]) {
-      self = createCallable(name, joinPrototype(Object.getPrototypeOf(this), Function.prototype), tracker)
+      self = createCallable(
+        name,
+        joinPrototype(Object.getPrototypeOf(this), Function.prototype),
+        tracker
+      )
     }
     if (_ctx) {
       self.ctx = _ctx

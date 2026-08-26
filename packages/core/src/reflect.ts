@@ -1,9 +1,9 @@
 import { defineProperty, Dict, isNullable } from 'cosmokit'
-import { Context } from './context'
-import { getTraceable, isObject, isUnproxyable, symbols, withProps } from './utils'
+import { Context } from './context.ts'
+import { getTraceable, isObject, isUnproxyable, symbols, withProps } from './utils.ts'
 
-declare module './context' {
-  interface Context {
+declare module './context.ts' {
+  export interface Context {
     get<K extends string & keyof this>(name: K): undefined | this[K]
     get(name: string): any
     set<K extends string & keyof this>(name: K, value: undefined | this[K]): () => void
