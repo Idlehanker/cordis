@@ -25,7 +25,7 @@ export type Callable<T, R extends unknown[]> = ((...args: R) => T) | (new (...ar
 
 export interface AcceptOptions {
   passive?: boolean
-  immediate?: boolean
+  immediate?: boolean //立即执行类型
 }
 
 export interface Acceptor extends AcceptOptions {
@@ -47,8 +47,16 @@ export class CordisError extends Error {
   }
 }
 
+/**
+ * This common TypeScript idiom (declaration merging of a type and a value with the same name) lets consumers use `CordisError.Code` both as a type (`let c: CordisError.Code`) and as a dictionary value (`CordisError.Code[code]`).
+ * 
+ * 1. `let c: CordisError.Code` => `type Code` in Type Space
+ * 2. `CordisError.Code['INACTIVE_EFFECT']` => `const Code` in Value Space.
+ */
 export namespace CordisError {
-  export type Code = keyof typeof Code
+
+  //The left `Code` is in Type-Space; However, the riht `Code` is in Value-Space.
+  export type Code = keyof typeof Code // `typeof Code` get whole object `Code`, then `keyof typeof Code` get key `INACTIVE_EFFECT`
 
   export const Code = {
     INACTIVE_EFFECT: 'cannot create effect on inactive context',
@@ -74,6 +82,8 @@ export abstract class EffectScope<C extends Context = Context> {
   abstract dispose(): boolean
   abstract update(config: C['config'], forced?: boolean): void
 
+  // `C` is `Context` type;
+  // `C['config']` => get the `config` field of `Context`.
   constructor(public parent: C, public config: C['config']) {
     this.uid = parent.registry ? parent.registry.counter : 0
     this.ctx = this.context = parent.extend({ scope: this })
@@ -176,9 +186,9 @@ export abstract class EffectScope<C extends Context = Context> {
     this.isActive = false
     this.disposables = this.disposables.splice(0).filter((dispose) => {
       if (this.uid !== null && dispose[Context.static] === this) return true
-      ;(async () => dispose())().catch((reason) => {
-        this.context.emit(this.ctx, 'internal/error', reason)
-      })
+        ; (async () => dispose())().catch((reason) => {
+          this.context.emit(this.ctx, 'internal/error', reason)
+        })
     })
   }
 
