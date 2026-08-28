@@ -5,42 +5,120 @@ import { isConstructor, resolveConfig } from './utils.ts'
 
 declare module './context.ts' {
   export interface Context {
+    /** The active effect scope managing disposables and lifecycle for this context. */
     scope: EffectScope<this>
+    /** The root `MainScope` runtime of the plugin associated with this context. */
     runtime: MainScope<this>
+
+    /**
+     * Register a disposable effect function in the current scope.
+     *
+     * The callback is executed immediately. If it returns a cleanup function or an object with a `dispose()` method,
+     * the cleanup will be automatically invoked when this context scope is disposed or reset.
+     *
+     * @param callback The effect function or constructor to execute.
+     * @returns The return value of the effect callback.
+     */
     effect<T extends DisposableLike>(callback: Callable<T, [ctx: this]>): T
     effect<T extends DisposableLike, R>(callback: Callable<T, [ctx: this, config: R]>, config: R): T
-    /** @deprecated use `ctx.effect()` instead */
+
+    /**
+     * Collect a named disposable cleanup callback into the current scope.
+     *
+     * @deprecated Use `ctx.effect()` instead.
+     * @param label Name or label for the disposable.
+     * @param callback Cleanup callback function.
+     * @returns A function to manually trigger disposal.
+     */
     collect(label: string, callback: () => void): () => void
+
+    /**
+     * Register a configuration update acceptor to handle dynamic config changes without restarting the scope.
+     *
+     * @param callback Optional handler receiving the new configuration. Return `true` to force a scope restart.
+     * @param options Acceptor options (e.g. `immediate`, `passive`).
+     * @returns A disposable function to unregister this acceptor.
+     */
     accept(callback?: (config: this['config']) => void | boolean, options?: AcceptOptions): () => boolean
+
+    /**
+     * Register a configuration update acceptor for specific configuration keys.
+     *
+     * @param keys Configuration property keys to watch for changes.
+     * @param callback Optional handler receiving the new configuration. Return `true` to force a scope restart.
+     * @param options Acceptor options (e.g. `immediate`, `passive`).
+     * @returns A disposable function to unregister this acceptor.
+     */
     accept(keys: (keyof this['config'])[], callback?: (config: this['config']) => void | boolean, options?: AcceptOptions): () => boolean
+
+    /**
+     * Mark specific configuration keys as non-hot-reloadable, forcing a full scope restart when they change.
+     *
+     * @param keys Configuration property keys to watch.
+     * @returns A disposable function to unregister this decline rule.
+     */
     decline(keys: (keyof this['config'])[]): () => boolean
   }
 }
 
+/**
+ * Cleanup function signature executed when a scope is disposed or reset.
+ */
 export type Disposable = () => void
 
+/**
+ * Represents a disposable resource, either a plain cleanup function or an object implementing `{ dispose: Disposable }`.
+ */
 export type DisposableLike = Disposable | { dispose: Disposable }
 
+/**
+ * Callable function or constructor type.
+ */
 export type Callable<T, R extends unknown[]> = ((...args: R) => T) | (new (...args: R) => T)
 
+/**
+ * Options for configuring dynamic config update acceptors.
+ */
 export interface AcceptOptions {
+  /**
+   * If `true`, the acceptor will not prevent restart when unwatched keys change.
+   */
   passive?: boolean
-  immediate?: boolean //立即执行类型
+  /**
+   * If `true`, immediately invoke the callback upon registration with current config.
+   */
+  immediate?: boolean
 }
 
+/**
+ * Internal acceptor descriptor stored in an EffectScope.
+ */
 export interface Acceptor extends AcceptOptions {
+  /** Property keys to monitor. */
   keys?: string[]
+  /** Callback to invoke on configuration update. Returning `true` signals that scope restart is required. */
   callback?: (config: any) => void | boolean
 }
 
+/**
+ * Lifecycle status of an EffectScope.
+ */
 export const enum ScopeStatus {
+  /** Scope is waiting for required dependencies to become available. */
   PENDING,
+  /** Scope is executing asynchronous initialization tasks. */
   LOADING,
+  /** Scope is fully initialized, dependencies satisfied, and active. */
   ACTIVE,
+  /** Scope encountered an error during initialization or execution. */
   FAILED,
+  /** Scope has been disposed and its resources cleaned up. */
   DISPOSED,
 }
 
+/**
+ * Custom error class for Cordis runtime errors.
+ */
 export class CordisError extends Error {
   constructor(public code: CordisError.Code, message?: string) {
     super(message ?? CordisError.Code[code])
@@ -48,42 +126,60 @@ export class CordisError extends Error {
 }
 
 /**
- * This common TypeScript idiom (declaration merging of a type and a value with the same name) lets consumers use `CordisError.Code` both as a type (`let c: CordisError.Code`) and as a dictionary value (`CordisError.Code[code]`).
- * 
- * 1. `let c: CordisError.Code` => `type Code` in Type Space
- * 2. `CordisError.Code['INACTIVE_EFFECT']` => `const Code` in Value Space.
+ * CordisError error code definitions and type declarations.
  */
 export namespace CordisError {
-
-  //The left `Code` is in Type-Space; However, the riht `Code` is in Value-Space.
-  export type Code = keyof typeof Code // `typeof Code` get whole object `Code`, then `keyof typeof Code` get key `INACTIVE_EFFECT`
+  export type Code = keyof typeof Code
 
   export const Code = {
     INACTIVE_EFFECT: 'cannot create effect on inactive context',
   } as const
 }
 
+/**
+ * Abstract base class managing disposables, lifecycle states, asynchronous tasks,
+ * and reactive configuration updates for a context execution scope.
+ *
+ * @template C The Context subtype used in this scope.
+ */
 export abstract class EffectScope<C extends Context = Context> {
+  /** Unique sequential identifier for this scope. Set to `null` once disposed. */
   public uid: number | null
+  /** The context instance bound to this scope. */
   public ctx: C
+  /** List of cleanup functions registered in this scope. */
   public disposables: Disposable[] = []
+  /** Error object if the scope entered the `FAILED` state. */
   public error: any
+  /** Current lifecycle status of this scope. */
   public status = ScopeStatus.PENDING
+  /** Whether the scope is currently active and executing. */
   public isActive = false
 
-  // Same as `this.ctx`, but with a more specific type.
+  /** Protected reference to context. */
   protected context: Context
+  /** Reactive proxy for configuration access when `isReactive` is enabled. */
   protected proxy: any
+  /** Registered configuration update acceptors. */
   protected acceptors: Acceptor[] = []
+  /** Set of pending asynchronous tasks belonging to this scope. */
   protected tasks = new Set<Promise<void>>()
+  /** Internal flag indicating error state. */
   protected hasError = false
 
+  /** Reference to the root `MainScope` runtime. */
   abstract runtime: MainScope<C>
+  /** Dispose of this scope and all registered resources. */
   abstract dispose(): boolean
+  /** Update the configuration of this scope. */
   abstract update(config: C['config'], forced?: boolean): void
 
-  // `C` is `Context` type;
-  // `C['config']` => get the `config` field of `Context`.
+  /**
+   * Create a new EffectScope.
+   *
+   * @param parent The parent Context instance.
+   * @param config Configuration object for this scope.
+   */
   constructor(public parent: C, public config: C['config']) {
     this.uid = parent.registry ? parent.registry.counter : 0
     this.ctx = this.context = parent.extend({ scope: this })
@@ -92,15 +188,30 @@ export abstract class EffectScope<C extends Context = Context> {
     })
   }
 
+  /**
+   * Get the effective configuration object (reactive proxy if reactive, raw config otherwise).
+   */
   protected get _config() {
     return this.runtime.isReactive ? this.proxy : this.config
   }
 
+  /**
+   * Assert that the current scope is active and has not been disposed.
+   *
+   * @throws {CordisError} If the scope is inactive/disposed.
+   */
   assertActive() {
     if (this.uid !== null || this.isActive) return
     throw new CordisError('INACTIVE_EFFECT')
   }
 
+  /**
+   * Execute an effect function or constructor and register its return value for automatic disposal.
+   *
+   * @param callback The function or constructor to execute.
+   * @param config Optional configuration passed to the callback.
+   * @returns The disposable callback or result object.
+   */
   effect(callback: Callable<DisposableLike, [ctx: C, config: any]>, config?: any) {
     this.assertActive()
     const result = isConstructor(callback)
@@ -122,6 +233,13 @@ export abstract class EffectScope<C extends Context = Context> {
     return result
   }
 
+  /**
+   * Register a named disposable cleanup function in this scope.
+   *
+   * @param label Name or label for the disposable.
+   * @param callback Function to run on cleanup.
+   * @returns The wrapped disposable function.
+   */
   collect(label: string, callback: () => any) {
     const dispose = defineProperty(() => {
       remove(this.disposables, dispose)
@@ -131,6 +249,9 @@ export abstract class EffectScope<C extends Context = Context> {
     return dispose
   }
 
+  /**
+   * Restart this scope by resetting all disposables, clearing errors, and calling `start()`.
+   */
   restart() {
     this.reset()
     this.error = null
@@ -139,6 +260,9 @@ export abstract class EffectScope<C extends Context = Context> {
     this.start()
   }
 
+  /**
+   * Compute the current lifecycle status based on uid, errors, pending tasks, and dependency readiness.
+   */
   protected _getStatus() {
     if (this.uid === null) return ScopeStatus.DISPOSED
     if (this.hasError) return ScopeStatus.FAILED
@@ -147,6 +271,11 @@ export abstract class EffectScope<C extends Context = Context> {
     return ScopeStatus.PENDING
   }
 
+  /**
+   * Update the status of this scope, emitting an `internal/status` event if the status changed.
+   *
+   * @param callback Optional mutation callback to execute before recalculating status.
+   */
   updateStatus(callback?: () => void) {
     const oldValue = this.status
     callback?.()
@@ -156,6 +285,11 @@ export abstract class EffectScope<C extends Context = Context> {
     }
   }
 
+  /**
+   * Register an asynchronous task and track it in `this.tasks` until completion.
+   *
+   * @param callback Async function returning a promise.
+   */
   ensure(callback: () => Promise<void>) {
     const task = callback()
       .catch((reason) => {
@@ -170,18 +304,29 @@ export abstract class EffectScope<C extends Context = Context> {
     this.context.events._tasks.add(task)
   }
 
+  /**
+   * Mark this scope as failed with an error reason and reset active disposables.
+   *
+   * @param reason The error that caused cancellation.
+   */
   cancel(reason?: any) {
     this.error = reason
     this.updateStatus(() => this.hasError = true)
     this.reset()
   }
 
+  /**
+   * Check whether all required service dependencies are satisfied on the context.
+   */
   get ready() {
     return Object.entries(this.runtime.inject).every(([name, inject]) => {
       return !inject.required || !isNullable(this.ctx.get(name))
     })
   }
 
+  /**
+   * Reset active state and execute all disposables (except static disposables bound to this scope).
+   */
   reset() {
     this.isActive = false
     this.disposables = this.disposables.splice(0).filter((dispose) => {
@@ -192,6 +337,9 @@ export abstract class EffectScope<C extends Context = Context> {
     })
   }
 
+  /**
+   * Initialize the scope with configuration or cancel if config is invalid.
+   */
   protected init(error?: any) {
     if (!this.config) {
       this.cancel(error)
@@ -200,12 +348,20 @@ export abstract class EffectScope<C extends Context = Context> {
     }
   }
 
+  /**
+   * Start the scope if all dependencies are ready, it is not already active, and not disposed.
+   *
+   * @returns `true` if activation was skipped (e.g. not ready or already active).
+   */
   start() {
     if (!this.ready || this.isActive || this.uid === null) return true
     this.isActive = true
     this.updateStatus(() => this.hasError = false)
   }
 
+  /**
+   * Register a configuration update acceptor handler.
+   */
   accept(callback?: (config: C['config']) => void | boolean, options?: AcceptOptions): () => boolean
   accept(keys: string[], callback?: (config: C['config']) => void | boolean, options?: AcceptOptions): () => boolean
   accept(...args: any[]) {
@@ -218,10 +374,21 @@ export abstract class EffectScope<C extends Context = Context> {
     })
   }
 
+  /**
+   * Decline configuration updates for specified keys, forcing a scope restart when changed.
+   */
   decline(keys: string[]) {
     return this.accept(keys, () => true)
   }
 
+  /**
+   * Compare resolved configuration against current configuration and determine whether
+   * an update occurred and whether a restart is necessary based on registered acceptors.
+   *
+   * @param resolved The new validated configuration.
+   * @param forced Whether update or restart is explicitly forced.
+   * @returns Tuple of `[hasUpdate: boolean, shouldRestart: boolean]`.
+   */
   checkUpdate(resolved: any, forced?: boolean) {
     if (forced || !this.config) return [true, true]
     if (forced === false) return [false, false]
@@ -263,9 +430,26 @@ export abstract class EffectScope<C extends Context = Context> {
   }
 }
 
+/**
+ * ForkScope represents a specific context fork / execution instance of a plugin.
+ *
+ * Each call to `ctx.plugin()` produces a `ForkScope` attached to the caller context,
+ * allowing independent lifecycles, configuration overrides, and automatic cascade disposal.
+ *
+ * @template C The Context subtype.
+ */
 export class ForkScope<C extends Context = Context> extends EffectScope<C> {
+  /** Function to dispose of this specific fork. */
   dispose: () => boolean
 
+  /**
+   * Create a new ForkScope.
+   *
+   * @param parent The calling context.
+   * @param runtime The master MainScope runtime for the plugin.
+   * @param config The fork configuration.
+   * @param error Optional pre-existing error.
+   */
   constructor(parent: Context, public runtime: MainScope<C>, config: C['config'], error?: any) {
     super(parent as C, config)
 
@@ -286,6 +470,9 @@ export class ForkScope<C extends Context = Context> extends EffectScope<C> {
     this.init(error)
   }
 
+  /**
+   * Activate this fork and execute all forkable callbacks registered by the master runtime.
+   */
   start() {
     if (super.start()) return true
     for (const fork of this.runtime.forkables) {
@@ -293,6 +480,12 @@ export class ForkScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Update the configuration of this fork.
+   *
+   * @param config New configuration object.
+   * @param forced Whether to force update/restart.
+   */
   update(config: any, forced?: boolean) {
     const oldConfig = this.config
     const state: EffectScope<C> = this.runtime.isForkable ? this : this.runtime
@@ -315,18 +508,43 @@ export class ForkScope<C extends Context = Context> extends EffectScope<C> {
   }
 }
 
+/**
+ * MainScope represents the master runtime state of a registered plugin in the Cordis registry.
+ *
+ * It manages the plugin definition, schema validation, dependency requirements (`inject`),
+ * reusable child forks (`children`), and plugin instantiation (`apply`).
+ *
+ * @template C The Context subtype.
+ */
 export class MainScope<C extends Context = Context> extends EffectScope<C> {
+  /** The value returned by instantiating the plugin (e.g. service instance). */
   public value: any
 
+  /** Self-reference as runtime. */
   runtime = this
+  /** Configuration schema / transform function. */
   schema: any
+  /** Plugin name. */
   name?: string
+  /** Resolved dependency requirements dictionary. */
   inject: Dict<Inject.Meta> = Object.create(null)
+  /** List of factory/fork callbacks invoked when a child fork starts. */
   forkables: Function[] = []
+  /** List of active child ForkScopes created from this runtime. */
   children: ForkScope<C>[] = []
+  /** Whether the plugin is marked reusable across contexts. */
   isReusable?: boolean = false
+  /** Whether the plugin configuration is reactive. */
   isReactive?: boolean = false
 
+  /**
+   * Create a new MainScope runtime.
+   *
+   * @param ctx The context where the plugin is registered.
+   * @param plugin The plugin definition (null for root context).
+   * @param config Initial configuration.
+   * @param error Optional error during plugin resolution.
+   */
   constructor(ctx: C, public plugin: Plugin, config: any, error?: any) {
     super(ctx, config)
     if (!plugin) {
@@ -338,14 +556,28 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Whether this runtime contains forkable callbacks to execute per fork.
+   */
   get isForkable() {
     return this.forkables.length > 0
   }
 
+  /**
+   * Create a new `ForkScope` attached to the specified parent context.
+   *
+   * @param parent The parent context requesting the fork.
+   * @param config Configuration for the fork.
+   * @param error Optional error state.
+   * @returns The created ForkScope.
+   */
   fork(parent: Context, config: any, error?: any) {
     return new ForkScope(parent, this, config, error)
   }
 
+  /**
+   * Dispose of this master runtime, clearing all child forks and listeners.
+   */
   dispose() {
     this.uid = null
     this.reset()
@@ -353,6 +585,9 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     return true
   }
 
+  /**
+   * Parse plugin metadata (name, schema, inject, reusable, reactive) and prepare forkable callbacks.
+   */
   private setup() {
     const { name } = this.plugin
     if (name && name !== 'apply') this.name = name
@@ -367,6 +602,9 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Instantiate / execute the plugin definition.
+   */
   private apply = (context: C, config: any) => {
     if (typeof this.plugin !== 'function') {
       return this.plugin.apply(context, config)
@@ -386,6 +624,9 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Reset this master runtime and cascade reset to all child forks.
+   */
   reset() {
     super.reset()
     for (const fork of this.children) {
@@ -393,6 +634,9 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Start this master runtime and cascade start to all child forks.
+   */
   start() {
     if (super.start()) return true
     if (!this.isReusable && this.plugin) {
@@ -403,6 +647,12 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     }
   }
 
+  /**
+   * Update the configuration of this master runtime and synchronize child forks.
+   *
+   * @param config New configuration object.
+   * @param forced Whether to force update/restart.
+   */
   update(config: C['config'], forced?: boolean) {
     if (this.isForkable) {
       const warning = new Error(`attempting to update forkable plugin "${this.plugin.name}", which may lead to unexpected behavior`)
@@ -429,3 +679,4 @@ export class MainScope<C extends Context = Context> extends EffectScope<C> {
     if (shouldRestart) this.restart()
   }
 }
+

@@ -4,20 +4,78 @@ import { getTraceable, isObject, isUnproxyable, symbols, withProps } from './uti
 
 declare module './context.ts' {
   export interface Context {
+    /**
+     * Retrieve a service instance by name, bound and traced to the current context.
+     *
+     * @param name The registered service name.
+     * @returns The service instance or `undefined` if not registered or available.
+     */
     get<K extends string & keyof this>(name: K): undefined | this[K]
     get(name: string): any
+
+    /**
+     * Register or update a service value on the context.
+     *
+     * When a service is set, an effect is created to automatically unregister it when this context scope is disposed.
+     * Emits `internal/before-service` and `internal/service` lifecycle events.
+     *
+     * @param name The service name.
+     * @param value The service value or instance.
+     * @returns A disposable function to unregister the service.
+     */
     set<K extends string & keyof this>(name: K, value: undefined | this[K]): () => void
     set(name: string, value: any): () => void
-    /** @deprecated use `ctx.set()` instead */
+
+    /**
+     * Define a service property descriptor on Context.
+     *
+     * @deprecated Use `ctx.set()` instead.
+     * @param name The service name.
+     * @param value Initial service value.
+     * @param builtin Whether the service is a built-in core service.
+     */
     provide(name: string, value?: any, builtin?: boolean): void
+
+    /**
+     * Register a dynamic accessor property (getter/setter) on Context.
+     * The accessor will be automatically unregistered when this context's scope is disposed.
+     *
+     * @param name The property name.
+     * @param options Getter and optional setter functions.
+     */
     accessor(name: string, options: Omit<Context.Internal.Accessor, 'type'>): void
+
+    /**
+     * Register aliases pointing to an existing service or accessor on Context.
+     *
+     * @param name The canonical target service name.
+     * @param aliases Array of alias names.
+     */
     alias(name: string, aliases: string[]): void
+
+    /**
+     * Delegate properties and methods from a service or target object directly onto the Context.
+     *
+     * @param name Service name or target object.
+     * @param mixins List of property keys or key-to-name mapping dictionary.
+     */
     mixin<K extends string & keyof this>(name: K, mixins: (keyof this & keyof this[K])[] | Dict<string>): void
     mixin<T extends {}>(source: T, mixins: (keyof this & keyof T)[] | Dict<string>): void
   }
 }
 
+/**
+ * ReflectService manages the dynamic Context Proxy behavior, service isolation resolution,
+ * property accessors, mixins, and dependency usage warnings in Cordis.
+ */
 class ReflectService {
+  /**
+   * Resolve an alias chain to find the canonical service name and its internal descriptor.
+   *
+   * @param ctx The context to inspect.
+   * @param name The initial property/alias name.
+   * @returns Tuple containing `[canonicalName, internalDescriptor]`.
+   */
   static resolveInject(ctx: Context, name: string) {
     let internal = ctx[symbols.internal][name]
     while (internal?.type === 'alias') {
@@ -27,6 +85,14 @@ class ReflectService {
     return [name, internal] as const
   }
 
+  /**
+   * Verify that property access on Context is permitted according to declared plugin dependencies (`inject`),
+   * emitting a warning event if undeclared services are accessed.
+   *
+   * @param ctx The calling context.
+   * @param name Property/service name being accessed.
+   * @param error Warning error object.
+   */
   static checkInject(ctx: Context, name: string, error: Error) {
     ctx = ctx[symbols.shadow] ?? ctx
     // Case 1: built-in services and special properties
@@ -42,6 +108,9 @@ class ReflectService {
     ctx.emit(ctx, 'internal/warning', error)
   }
 
+  /**
+   * ProxyHandler applied to Context instances to intercept property access, service lookup, and method delegation.
+   */
   static handler: ProxyHandler<Context> = {
     get: (target, prop, ctx: Context) => {
       if (typeof prop !== 'string') return Reflect.get(target, prop, ctx)
@@ -93,6 +162,14 @@ class ReflectService {
     },
   }
 
+  /**
+   * Create a new ReflectService instance.
+   *
+   * Initializes context tracking metadata and mixes in core methods and properties from
+   * `reflect`, `scope`, `registry`, and `lifecycle` onto the Context.
+   *
+   * @param ctx The context bound to this reflect service.
+   */
   constructor(public ctx: Context) {
     defineProperty(this, symbols.tracker, {
       associate: 'reflect',
@@ -105,6 +182,12 @@ class ReflectService {
     this._mixin('lifecycle', ['on', 'once', 'parallel', 'emit', 'serial', 'bail', 'start', 'stop'])
   }
 
+  /**
+   * Retrieve a service value from the store taking into account the context's service isolation key.
+   *
+   * @param name The service name.
+   * @returns The traceable service instance or `undefined`.
+   */
   get(name: string) {
     const internal = this.ctx[symbols.internal][name]
     if (internal?.type !== 'service') return
@@ -113,6 +196,13 @@ class ReflectService {
     return getTraceable(this.ctx, value)
   }
 
+  /**
+   * Set or update a service value on the context with effect tracking and lifecycle event emission.
+   *
+   * @param name Service name.
+   * @param value Service value.
+   * @returns A disposable function to unregister the service.
+   */
   set(name: string, value: any) {
     this.provide(name)
     const key = this.ctx[symbols.isolate][name]
@@ -147,6 +237,13 @@ class ReflectService {
     return dispose
   }
 
+  /**
+   * Initialize a service entry in `symbols.internal` and setup its isolation key on the root context.
+   *
+   * @param name Service name.
+   * @param value Optional initial value.
+   * @param builtin Whether the service is a built-in core service.
+   */
   provide(name: string, value?: any, builtin?: boolean) {
     const internal = this.ctx.root[symbols.internal]
     if (name in internal) return
@@ -161,6 +258,9 @@ class ReflectService {
     })
   }
 
+  /**
+   * Internal implementation to register an accessor property on root Context.
+   */
   _accessor(name: string, options: Omit<Context.Internal.Accessor, 'type'>) {
     const internal = this.ctx.root[symbols.internal]
     if (name in internal) return () => {}
@@ -168,12 +268,18 @@ class ReflectService {
     return () => delete this.ctx.root[symbols.isolate][name]
   }
 
+  /**
+   * Register a dynamic accessor property (getter/setter) on Context bound to current scope.
+   */
   accessor(name: string, options: Omit<Context.Internal.Accessor, 'type'>) {
     this.ctx.scope.effect(() => {
       return this._accessor(name, options)
     })
   }
 
+  /**
+   * Register aliases pointing to an existing service/accessor.
+   */
   alias(name: string, aliases: string[]) {
     const internal = this.ctx.root[symbols.internal]
     if (name in internal) return
@@ -182,6 +288,9 @@ class ReflectService {
     }
   }
 
+  /**
+   * Internal implementation to mix in properties and methods onto Context.
+   */
   _mixin(source: any, mixins: string[] | Dict<string>) {
     const entries = Array.isArray(mixins) ? mixins.map(key => [key, key]) : Object.entries(mixins)
     const getTarget = typeof source === 'string' ? (ctx: Context) => ctx[source] : () => source
@@ -205,16 +314,25 @@ class ReflectService {
     return () => disposables.forEach(dispose => dispose())
   }
 
+  /**
+   * Mix in properties and methods from a service or target object onto Context, bound to current scope.
+   */
   mixin(source: any, mixins: string[] | Dict<string>) {
     this.ctx.scope.effect(() => {
       return this._mixin(source, mixins)
     })
   }
 
+  /**
+   * Wrap a value in a traceable proxy with current context.
+   */
   trace<T>(value: T) {
     return getTraceable(this.ctx, value)
   }
 
+  /**
+   * Wrap a callback function to automatically trace `thisArg` and arguments upon execution.
+   */
   bind<T extends Function>(callback: T) {
     return new Proxy(callback, {
       apply: (target, thisArg, args) => {
@@ -225,3 +343,4 @@ class ReflectService {
 }
 
 export default ReflectService
+
