@@ -11,14 +11,35 @@ import zhCN from './locales/zh-CN.yml'
 
 declare module 'cordis' {
   interface Context {
+    /**
+     * Hot Module Replacement (HMR) service instance.
+     */
     hmr: Watcher
   }
 
   interface Events {
+    /**
+     * Emitted after a successful hot module reload of one or more plugins.
+     *
+     * @param reloads - Map of old plugin definitions to their reload metadata and restored fork scopes.
+     */
     'hmr/reload'(reloads: Map<Plugin, Reload>): void
   }
 }
 
+/**
+ * Recursively traverses and collects all module dependencies linked to a {@link ModuleJob}.
+ *
+ * Traversal ignores:
+ * - Module URLs already in the `ignored` set.
+ * - Module URLs already visited in `dependencies`.
+ * - Node.js built-in modules (e.g. `node:*`).
+ * - Third-party packages inside `/node_modules/`.
+ *
+ * @param job - The root module job to start dependency discovery from.
+ * @param ignored - Optional set of module URLs to skip during traversal.
+ * @returns A promise resolving to the set of all collected module URLs.
+ */
 async function loadDependencies(job: ModuleJob, ignored = new Set<string>()) {
   const dependencies = new Set<string>()
   async function traverse(job: ModuleJob) {
@@ -31,44 +52,72 @@ async function loadDependencies(job: ModuleJob, ignored = new Set<string>()) {
   return dependencies
 }
 
+/**
+ * Metadata representing a plugin reload task.
+ */
 interface Reload {
+  /** The module URL or filename of the plugin entry point. */
   filename: string
+  /** The array of active fork scopes that need to be re-instantiated with the reloaded plugin. */
   children: ForkScope[]
 }
 
+/**
+ * Hot Module Replacement (HMR) Watcher Service for Cordis.
+ *
+ * Watches the file system for source code and configuration changes using `chokidar`,
+ * performs dependency graph analysis through the Node.js module loader hooks (`ModuleLoader`),
+ * and orchestrates atomic plugin reloads while preserving configurations and fork states.
+ */
 class Watcher extends Service {
+  /** Required dependencies injected by the Cordis context. */
   static inject = ['loader']
 
+  /** Resolved absolute base directory path for relative path resolution and file watching. */
   private base: string
+
+  /** Internal module loader instance exposed by Node via `--expose-internals`. */
   private internal: ModuleLoader
+
+  /** File system watcher instance from chokidar. */
   private watcher!: FSWatcher
 
   /**
-   * changes from externals E will always trigger a full reload
+   * Set of module URLs considered "external" core dependencies (e.g., `cordis/worker` and its runtime graph).
    *
+   * Changes to any file in `externals` cannot be hot-swapped safely in-place and will trigger a full process restart:
    * - root R -> external E -> none of plugin Q
    */
   private externals!: Set<string>
 
   /**
-   * files X that should be reloaded
+   * Set of module URLs that have been analyzed and accepted for hot reloading.
    *
-   * - including all stashed files S
+   * - Includes all stashed changed files S
    * - some plugin P -> file X -> some change C
    */
   private accepted!: Set<string>
 
   /**
-   * files X that should not be reloaded
+   * Set of module URLs that should not be reloaded.
    *
-   * - including all externals E
+   * - Includes all externals E
    * - some change C -> file X -> none of change D
    */
   private declined!: Set<string>
 
-  /** stashed changes */
+  /**
+   * Set of changed file URLs accumulated since the last reload cycle.
+   */
   private stashed = new Set<string>()
 
+  /**
+   * Constructs a new HMR Watcher service instance.
+   *
+   * @param ctx - The Cordis context to bind this service to.
+   * @param config - The watcher configuration options.
+   * @throws Error if Node was not started with `--expose-internals` (required for loader hooks).
+   */
   constructor(ctx: Context, public config: Watcher.Config) {
     super(ctx, 'hmr')
     if (!this.ctx.loader.internal) {
@@ -78,11 +127,28 @@ class Watcher extends Service {
     this.base = resolve(ctx.baseDir, config.base || '')
   }
 
+  /**
+   * Computes the relative path of a given filename with respect to the watcher's base directory.
+   *
+   * @param filename - Absolute or relative path of the file.
+   * @returns Relative path if base is defined; otherwise the original filename.
+   */
   relative(filename: string) {
     if (!this.base) return filename
     return relative(this.base, filename)
   }
 
+  /**
+   * Initializes file watchers and starts monitoring for module and configuration changes.
+   *
+   * Lifecycle actions:
+   * 1. Starts chokidar file watcher on configured root paths with ignored patterns.
+   * 2. Inspects `cordis/worker` module job to determine non-reloadable external dependencies.
+   * 3. Sets up debounced change listener to handle file modifications:
+   *    - External file change -> triggers full process exit via `loader.exit()`.
+   *    - Cached module file change -> stashes URL and schedules local reload.
+   *    - Config/tree file change -> refreshes config tree (unless suspended).
+   */
   async start() {
     const { loader } = this.ctx
     const { root, ignored } = this.config
@@ -119,10 +185,22 @@ class Watcher extends Service {
     })
   }
 
+  /**
+   * Stops the file watcher and releases resources.
+   */
   async stop() {
     return await this.watcher.close()
   }
 
+  /**
+   * Retrieves the absolute file paths of all modules linked/imported by the given module.
+   *
+   * Queries the loader's `loadCache` for the corresponding {@link ModuleJob} and resolves
+   * each linked job's URL back to a file path.
+   *
+   * @param filename - Absolute file path of the module to query.
+   * @returns A promise resolving to an array of linked file paths.
+   */
   async getLinked(filename: string) {
     // The second parameter `type` should always be `javascript`.
     const job = this.internal.loadCache.get(pathToFileURL(filename).toString())
@@ -131,6 +209,18 @@ class Watcher extends Service {
     return linked.map(job => fileURLToPath(job.url))
   }
 
+  /**
+   * Propagates changes across the module dependency graph to classify modules as `accepted` or `declined`.
+   *
+   * Classification algorithm:
+   * 1. Initializes `accepted` with all stashed modified files, and `declined` with external core files.
+   * 2. Inspects direct and transitive linked children of stashed files.
+   * 3. Iteratively evaluates pending modules until closure:
+   *    - If any linked child of a module is accepted, the module is marked `accepted`.
+   *    - If all linked children of a module are declined, the module is marked `declined`.
+   *    - Modules with undecided dependencies remain in `pending` for subsequent passes.
+   * 4. Any modules remaining unresolvable after graph convergence are marked `declined`.
+   */
   private async analyzeChanges() {
     /** files pending classification */
     const pending: string[] = []
@@ -191,6 +281,22 @@ class Watcher extends Service {
     }
   }
 
+  /**
+   * Executes the local hot reload workflow for affected plugins.
+   *
+   * Step-by-step workflow:
+   * 1. **Change Analysis**: Invokes {@link analyzeChanges} to classify modified/affected modules.
+   * 2. **Plugin Discovery**: Resolves active loader entries to identify candidate plugin entry jobs.
+   * 3. **Impact Detection**: Traverses dependency trees of plugins to see if any depend on `accepted` files.
+   * 4. **Fork Tracking**: Records active {@link ForkScope}s under each plugin's {@link MainScope} runtime.
+   * 5. **Cache Backup & Invalidation**: Backs up and deletes `accepted` modules from `internal.loadCache`.
+   * 6. **Re-import**: Dynamically re-imports modified plugin modules. On compilation error, invokes {@link handleError} and rolls back cache.
+   * 7. **Plugin Replacement**:
+   *    - Disposes old plugin from `ctx.registry`.
+   *    - Re-instantiates each fork scope using the new plugin export and previous config/entry references.
+   *    - If re-instantiation fails, rolls back both module cache and previous plugin instances.
+   * 8. **Event Notification**: Emits the `'hmr/reload'` event and clears `stashed` files.
+   */
   private async triggerLocalReload() {
     await this.analyzeChanges()
 
@@ -341,13 +447,23 @@ class Watcher extends Service {
 }
 
 namespace Watcher {
+  /**
+   * Configuration options for the {@link Watcher} service.
+   */
   export interface Config extends WatchOptions {
+    /** Base directory path for resolving relative file paths. */
     base?: string
+    /** Root directories or files to watch. */
     root: string[]
+    /** Debounce interval in milliseconds for batching file change events. */
     debounce: number
+    /** File glob patterns to ignore from watching and reloading. */
     ignored: string[]
   }
 
+  /**
+   * Cordis schema definition for {@link Watcher.Config}.
+   */
   export const Config: Schema<Config> = Schema.object({
     base: Schema.string(),
     root: Schema.union([
@@ -370,3 +486,4 @@ namespace Watcher {
 }
 
 export default Watcher
+
